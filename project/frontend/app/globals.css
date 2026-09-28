@@ -1,111 +1,17 @@
+@import "tailwindcss";
+
 * {
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
+  padding: 0;
+}
+
+body {
   font-family: Arial, Helvetica, sans-serif;
   background: #ffffff;
   color: #111111;
-}
-
-.container {
-  max-width: 420px;
-  margin: 60px auto;
-  padding: 24px;
-  border: 1px solid #cccccc;
-}
-
-.container-wide {
-  max-width: 640px;
-  margin: 40px auto;
-  padding: 24px;
-  border: 1px solid #cccccc;
-}
-
-h1 {
-  font-size: 20px;
-  margin: 0 0 16px 0;
-}
-
-label {
-  display: block;
-  margin-top: 12px;
-  margin-bottom: 4px;
-  font-size: 14px;
-}
-
-input, textarea {
-  width: 100%;
-  padding: 8px;
-  font-size: 14px;
-  border: 1px solid #999999;
-}
-
-textarea {
-  min-height: 60px;
-  resize: vertical;
-}
-
-button {
-  margin-top: 16px;
-  padding: 8px 16px;
-  font-size: 14px;
-  border: 1px solid #333333;
-  background: #f2f2f2;
-  cursor: pointer;
-}
-
-button:hover {
-  background: #e2e2e2;
-}
-
-button.secondary {
-  background: #ffffff;
-}
-
-.error {
-  color: #b00020;
-  font-size: 14px;
-  margin-top: 12px;
-}
-
-.top-bar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 16px;
-}
-
-.faq-item {
-  border: 1px solid #dddddd;
-  padding: 12px;
-  margin-bottom: 10px;
-}
-
-.faq-question {
-  font-weight: bold;
-}
-
-.faq-answer {
-  margin-top: 4px;
-  font-size: 14px;
-}
-
-.faq-delete {
-  margin-top: 8px;
-  font-size: 12px;
-  border-color: #b00020;
-  color: #b00020;
-  background: #ffffff;
-}
-
-.toggle-link {
-  margin-top: 12px;
-  font-size: 13px;
-  background: none;
-  border: none;
-  text-decoration: underline;
-  padding: 0;
-  cursor: pointer;
 }

@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from database import Base, engine, SessionLocal
 import models
 from routers import auth, faqs, tickets, jobs
+from routers import chat as chat_router
+from routers import profile as profile_router
 
 load_dotenv()
 
@@ -28,7 +30,8 @@ app.include_router(auth.router)
 app.include_router(faqs.router)
 app.include_router(tickets.router)
 app.include_router(jobs.router)
-
+app.include_router(chat_router.router)
+app.include_router(profile_router.router)
 
 SAMPLE_JOBS = [
     {"title": "Duty Doctor", "organization": "Arrow Diagnostics LLP", "location": "Chennai", "job_type": "Full Time", "salary": "780000/Annual", "description": "Conduct patient consultations and basic clinical examinations. Review lab and diagnostic reports."},

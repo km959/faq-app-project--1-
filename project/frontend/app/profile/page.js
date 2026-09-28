@@ -21,21 +21,28 @@ export default function ProfilePage() {
   if (!user) return null;
 
   return (
-    <div className="container">
-      <h1>View Profile</h1>
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-purple-50 to-teal-50">
+      <div className="bg-white rounded-2xl p-7 w-full max-w-sm shadow-lg">
+        <h1 className="text-xl font-bold mb-4 bg-gradient-to-r from-purple-600 to-teal-500 bg-clip-text text-transparent">
+          View Profile
+        </h1>
 
-      <label>Name</label>
-      <input value={user.name || ""} readOnly />
+        <label className="text-sm text-gray-600">Name</label>
+        <input value={user.name || ""} readOnly className="w-full mb-3 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-gray-50" />
 
-      <label>Email</label>
-      <input value={user.email || ""} readOnly />
+        <label className="text-sm text-gray-600">Email</label>
+        <input value={user.email || ""} readOnly className="w-full mb-3 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-gray-50" />
 
-      <label>Phone</label>
-      <input value={user.phone || ""} readOnly />
+        <label className="text-sm text-gray-600">Phone</label>
+        <input value={user.phone || ""} readOnly className="w-full mb-4 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-gray-50" />
 
-      <button onClick={() => router.push("/dashboard")} style={{ marginTop: 16, width: "100%" }}>
-        Back
-      </button>
+        <button
+          onClick={function () { router.push("/dashboard"); }}
+          className="w-full py-2.5 rounded-lg text-white font-semibold bg-gradient-to-r from-purple-600 to-teal-500"
+        >
+          Back
+        </button>
+      </div>
     </div>
   );
 }

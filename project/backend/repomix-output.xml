@@ -1,0 +1,1656 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+routers/
+  __init__.py
+  auth.py
+  chat.py
+  faqs.py
+  jobs.py
+  profile.py
+  tickets.py
+auth.py
+database.py
+main.py
+models.py
+requirements.txt
+schemas.py
+seed_knowledge_base.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="routers/__init__.py">
+
+</file>
+
+<file path="routers/auth.py">
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+import schemas
+from auth import hash_password, verify_password, create_access_token
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", response_model=schemas.Token, status_code=status.HTTP_201_CREATED)
+def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(models.User).filter(models.User.email == payload.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="An account with this email already exists")
+
+    role = payload.role if payload.role in ("user", "admin") else "user"
+
+    user = models.User(
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        name=payload.name,
+        phone=payload.phone,
+        role=role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token(subject=str(user.id))
+    return schemas.Token(access_token=token, user=user)
+
+
+@router.post("/login", response_model=schemas.Token)
+def login(payload: schemas.UserLogin, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    # This is the strict separation: a user account can never log into the
+    # admin flow, and an admin account can never log into the user flow -
+    # even with the right password.
+    if user.role != payload.role:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This account is not registered as {payload.role}",
+        )
+
+    token = create_access_token(subject=str(user.id))
+    return schemas.Token(access_token=token, user=user)
+</file>
+
+<file path="routers/chat.py">
+import os
+import uuid
+import requests
+import re
+from fastapi import APIRouter, Depends
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+import schemas
+from auth import get_current_user
+
+import re
+
+GREETING_PATTERN = re.compile(
+    r"^\s*(hi|hii|hiii|hello|hey|heyy|good\s?morning|good\s?afternoon|good\s?evening|yo|sup)\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+
+THANKS_PATTERN = re.compile(
+    r"^\s*(thanks|thank you|thankyou|ty|ok|okay|cool|great)\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
+FAQ_CONFIDENCE_THRESHOLD = 0.15
+SUGGESTION_THRESHOLD = 0.03
+
+
+CATEGORY_KEYWORDS = {
+    "billing": "Billing",
+    "payment": "Billing",
+    "subscription": "Billing",
+    "profile": "Personal",
+    "account": "Account",
+    "job": "Jobs",
+    "jobs": "Jobs",
+}
+
+
+STOPWORDS = {
+    "how", "is", "are", "the", "a", "an", "to", "for", "of", "do", "does",
+    "i", "can", "you", "your", "my", "what", "when", "where", "why", "who",
+    "in", "on", "at", "and", "or", "please", "me", "it", "this", "that",
+    "ur", "u", "am", "was", "were", "be", "will", "would", "should",
+}
+
+
+def categorize_subject(query: str) -> str:
+    q = query.lower()
+
+    if any(
+        word in q
+        for word in [
+            "bill",
+            "payment",
+            "subscription",
+            "invoice",
+            "salary",
+            "charge",
+        ]
+    ):
+        return "Billing"
+
+    if any(
+        word in q
+        for word in [
+            "profile",
+            "photo",
+            "picture",
+            "update my",
+        ]
+    ):
+        return "Profile"
+
+    if any(
+        word in q
+        for word in [
+            "account",
+            "delete",
+            "password",
+            "login",
+            "signup",
+            "mobile number",
+            "email",
+        ]
+    ):
+        return "Account"
+
+    if any(
+        word in q
+        for word in [
+            "apply",
+            "application",
+            "recommend",
+            "hiring",
+            "hire",
+        ]
+    ):
+        return "Jobs"
+
+    words = [w.strip(".,!?") for w in query.split()]
+    keywords = [
+        w
+        for w in words
+        if w.lower() not in STOPWORDS and len(w) > 2
+    ]
+
+    if keywords:
+        return " ".join(w.capitalize() for w in keywords[:3])
+
+    return "General Support"
+
+
+def search_knowledge_base(db: Session, query: str):
+    # Handle common typo in password-reset questions
+    query = re.sub(
+        r"\brest\s+password\b",
+        "reset password",
+        query,
+        flags=re.IGNORECASE,
+    )
+
+    result = db.execute(
+        text(
+            """
+            SELECT id, category, question, answer,
+                   ts_rank(
+                       to_tsvector('english', question || ' ' || answer),
+                       plainto_tsquery('english', :q)
+                   ) AS rank
+            FROM knowledge_base
+            WHERE to_tsvector(
+                'english',
+                question || ' ' || answer
+            ) @@ plainto_tsquery('english', :q)
+            ORDER BY rank DESC
+            LIMIT 3
+            """
+        ),
+        {"q": query},
+    ).fetchall()
+
+    return result
+
+
+def get_faq_by_exact_question(db: Session, question: str):
+    row = db.execute(
+        text(
+            """
+            SELECT id, category, question, answer
+            FROM knowledge_base
+            WHERE lower(question) = lower(:q)
+            LIMIT 1
+            """
+        ),
+        {"q": question.strip()},
+    ).fetchone()
+
+    return row
+
+
+def ask_gemini(
+    query: str,
+    context_faqs: list,
+    history: list,
+    retries: int = 1,
+):
+    if not GEMINI_API_KEY:
+        print("GEMINI: no API key set")
+        return None
+
+    context_text = (
+        "\n\n".join(
+            f"Q: {row.question}\nA: {row.answer}"
+            for row in context_faqs
+        )
+        if context_faqs
+        else "(no closely related FAQ found)"
+    )
+
+    instructions = f"""You are a support assistant for this healthcare job platform.
+Some possibly related FAQs are shown below for reference, but you are not limited to them.
+The conversation so far is included above this message. If the user's question is a
+follow-up (like "explain step 2" or "what about that"), find the relevant part of your
+own PREVIOUS answer in the conversation and explain it further — do not say NOT_FOUND
+just because the question alone seems vague; use the conversation context to understand it.
+Only reply with exactly NOT_FOUND if the question is truly unrelated to this platform,
+jobs, or support, even after considering the conversation.
+
+Related FAQs:
+{context_text}
+
+User question: {query}
+
+Answer:"""
+
+    contents = []
+
+    for turn in (history or []):
+        role = "model" if turn.role == "assistant" else "user"
+
+        contents.append(
+            {
+                "role": role,
+                "parts": [{"text": turn.text}],
+            }
+        )
+
+    contents.append(
+        {
+            "role": "user",
+            "parts": [{"text": instructions}],
+        }
+    )
+
+    attempts = retries + 1
+
+    for attempt in range(attempts):
+        try:
+            resp = requests.post(
+                GEMINI_URL,
+                headers={"x-goog-api-key": GEMINI_API_KEY},
+                json={"contents": contents},
+                timeout=30,
+            )
+
+            resp.raise_for_status()
+
+            data = resp.json()
+
+            text_out = (
+                data["candidates"][0]["content"]["parts"][0]["text"]
+                .strip()
+            )
+
+            print("GEMINI RAW RESPONSE:", text_out)
+
+            if "NOT_FOUND" in text_out:
+                return None
+
+            return text_out
+
+        except Exception as e:
+            print(
+                f"GEMINI ERROR (attempt {attempt + 1}/{attempts}):",
+                repr(e),
+            )
+
+            if attempt == attempts - 1:
+                return None
+
+    return None
+
+
+def get_category_suggestions(db: Session, query: str):
+    key = query.strip().lower()
+    category = CATEGORY_KEYWORDS.get(key)
+
+    if not category:
+        return None
+
+    rows = db.execute(
+        text(
+            """
+            SELECT question
+            FROM knowledge_base
+            WHERE category = :cat
+            LIMIT 5
+            """
+        ),
+        {"cat": category},
+    ).fetchall()
+
+    return [r.question for r in rows] if rows else None
+
+
+def get_related_questions(
+    db: Session,
+    category: str,
+    exclude_question: str = None,
+):
+    if not category:
+        return []
+
+    rows = db.execute(
+        text(
+            """
+            SELECT question
+            FROM knowledge_base
+            WHERE category = :cat
+              AND question != :exclude
+            ORDER BY random()
+            LIMIT 3
+            """
+        ),
+        {
+            "cat": category,
+            "exclude": exclude_question or "",
+        },
+    ).fetchall()
+
+    return [r.question for r in rows]
+
+
+@router.post("/ask", response_model=schemas.ChatResponse)
+def ask_chat(
+    payload: schemas.ChatQuery,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if GREETING_PATTERN.match(payload.query):
+        return schemas.ChatResponse(
+            source="greeting",
+            answer="Hi there! I'm here to help. Ask me anything about jobs, your profile, billing, or account settings.",
+        )
+
+    if THANKS_PATTERN.match(payload.query):
+        return schemas.ChatResponse(
+            source="greeting",
+            answer="You're welcome! Let me know if there's anything else I can help with.",
+        )
+
+    category_suggestions = get_category_suggestions(db, payload.query)
+
+    if category_suggestions:
+        return schemas.ChatResponse(
+            source="suggestions",
+            answer="Looking for something specific? Here are some related questions",
+            suggestions=category_suggestions,
+        )
+
+    if payload.is_suggestion:
+        exact = get_faq_by_exact_question(db, payload.query)
+
+        if exact:
+            related = get_related_questions(
+                db,
+                exact.category,
+                exact.question,
+            )
+
+            return schemas.ChatResponse(
+                source="faq",
+                answer=exact.answer,
+                matched_question=exact.question,
+                related_label="Looking for something specific? Here are some related questions"
+                if related
+                else None,
+                related_questions=related if related else None,
+            )
+
+    is_followup = (
+        bool(payload.history)
+        and len(payload.history) > 0
+        and not payload.is_suggestion
+    )
+
+    if not is_followup:
+        exact = get_faq_by_exact_question(db, payload.query)
+
+        if exact:
+            related = get_related_questions(
+                db,
+                exact.category,
+                exact.question,
+            )
+
+            return schemas.ChatResponse(
+                source="faq",
+                answer=exact.answer,
+                matched_question=exact.question,
+                related_label="Looking for something specific? Here are some related questions"
+                if related
+                else None,
+                related_questions=related if related else None,
+            )
+
+        # ---------------------------------------------------------
+        # PASSWORD FAQ FALLBACK
+        # This handles password questions before Gemini is called.
+        # It also handles common wording such as "rest password".
+        # ---------------------------------------------------------
+        normalized_query = payload.query.lower()
+
+        if (
+            "password" in normalized_query
+            and any(
+                word in normalized_query
+                for word in [
+                    "reset",
+                    "rest",
+                    "forgot",
+                    "change",
+                    "update",
+                ]
+            )
+        ):
+            password_faq = db.execute(
+                text(
+                    """
+                    SELECT id, category, question, answer
+                    FROM knowledge_base
+                    WHERE category = 'Account'
+                      AND (
+                          lower(question) LIKE '%password%'
+                          OR lower(answer) LIKE '%password%'
+                      )
+                    ORDER BY
+                        CASE
+                            WHEN lower(question) LIKE '%reset%' THEN 1
+                            ELSE 2
+                        END
+                    LIMIT 1
+                    """
+                )
+            ).fetchone()
+
+            if password_faq:
+                related = get_related_questions(
+                    db,
+                    password_faq.category,
+                    password_faq.question,
+                )
+
+                return schemas.ChatResponse(
+                    source="faq",
+                    answer=password_faq.answer,
+                    matched_question=password_faq.question,
+                    related_label="Looking for something specific? Here are some related questions"
+                    if related
+                    else None,
+                    related_questions=related if related else None,
+                )
+
+        matches = search_knowledge_base(db, payload.query)
+
+        if matches and matches[0].rank >= FAQ_CONFIDENCE_THRESHOLD:
+            top = matches[0]
+
+            related = get_related_questions(
+                db,
+                top.category,
+                top.question,
+            )
+
+            return schemas.ChatResponse(
+                source="faq",
+                answer=top.answer,
+                matched_question=top.question,
+                related_label="Looking for something specific? Here are some related questions"
+                if related
+                else None,
+                related_questions=related if related else None,
+            )
+
+        if matches and matches[0].rank >= SUGGESTION_THRESHOLD:
+            return schemas.ChatResponse(
+                source="suggestions",
+                answer="We weren't exactly sure what you were looking for, but these are some close matches",
+                suggestions=[m.question for m in matches],
+            )
+
+    else:
+        matches = search_knowledge_base(db, payload.query)
+
+    ai_answer = ask_gemini(
+        payload.query,
+        matches if matches else [],
+        payload.history,
+    )
+
+    if ai_answer:
+        fallback_category = matches[0].category if matches else None
+
+        related = (
+            get_related_questions(db, fallback_category)
+            if fallback_category
+            else []
+        )
+
+        return schemas.ChatResponse(
+            source="ai",
+            answer=ai_answer,
+            related_label="Looking for something specific? Here are some related questions"
+            if related
+            else None,
+            related_questions=related if related else None,
+        )
+
+    ticket = models.Ticket(
+        user_id=current_user.id,
+        contact_name=current_user.name or "User",
+        contact_email=current_user.email,
+        contact_phone=current_user.phone,
+        subject=categorize_subject(payload.query),
+        description=payload.query,
+        status="open",
+    )
+
+    db.add(ticket)
+    db.commit()
+    db.refresh(ticket)
+
+    return schemas.ChatResponse(
+        source="ticket",
+        answer="I couldn't find a confident answer to that. I've raised a support ticket so our team can help you directly.",
+        ticket=schemas.TicketOut.model_validate(ticket),
+    )
+</file>
+
+<file path="routers/faqs.py">
+import uuid
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+import schemas
+from auth import get_current_user
+
+router = APIRouter(prefix="/faqs", tags=["faqs"])
+
+
+@router.get("", response_model=list[schemas.FAQOut])
+def list_faqs(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    # Only this user's saved questions - this is what makes the data
+    # "remembered" the next time they log in.
+    return (
+        db.query(models.FAQ)
+        .filter(models.FAQ.user_id == current_user.id)
+        .order_by(models.FAQ.created_at.asc())
+        .all()
+    )
+
+
+@router.post("", response_model=schemas.FAQOut, status_code=201)
+def save_faq_answer(
+    payload: schemas.FAQCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    # Save-or-update: since the app uses a fixed set of questions,
+    # saving an answer to a question the user already answered updates
+    # it in place instead of creating a duplicate row.
+    existing = (
+        db.query(models.FAQ)
+        .filter(
+            models.FAQ.user_id == current_user.id,
+            models.FAQ.question == payload.question,
+        )
+        .first()
+    )
+    if existing:
+        existing.answer = payload.answer
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    faq = models.FAQ(
+        user_id=current_user.id,
+        question=payload.question,
+        answer=payload.answer,
+    )
+    db.add(faq)
+    db.commit()
+    db.refresh(faq)
+    return faq
+
+
+@router.delete("/{faq_id}", status_code=204)
+def delete_faq(
+    faq_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    faq = (
+        db.query(models.FAQ)
+        .filter(models.FAQ.id == faq_id, models.FAQ.user_id == current_user.id)
+        .first()
+    )
+    if not faq:
+        raise HTTPException(status_code=404, detail="FAQ not found")
+    db.delete(faq)
+    db.commit()
+    return None
+</file>
+
+<file path="routers/jobs.py">
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+import schemas
+
+router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+@router.get("", response_model=list[schemas.JobOut])
+def list_jobs(
+    q: str | None = Query(default=None, description="Search by job title"),
+    location: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    query = db.query(models.Job)
+    if q:
+        query = query.filter(models.Job.title.ilike(f"%{q}%"))
+    if location:
+        query = query.filter(models.Job.location.ilike(f"%{location}%"))
+    return query.order_by(models.Job.created_at.desc()).all()
+</file>
+
+<file path="routers/profile.py">
+import base64
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+from auth import get_current_user
+
+router = APIRouter(prefix="/profile", tags=["profile"])
+
+ALLOWED_EXTENSIONS = (".pdf", ".doc", ".docx", ".txt")
+MAX_SIZE_BYTES = 1 * 1024 * 1024
+
+
+@router.post("/resume")
+async def upload_resume(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    filename_lower = file.filename.lower()
+    if not filename_lower.endswith(ALLOWED_EXTENSIONS):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, DOC, DOCX, or TXT.")
+
+    content = await file.read()
+    if len(content) > MAX_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="File too large. Max size is 1MB.")
+
+    user = db.query(models.User).filter(models.User.id == current_user.id).first()
+    user.resume_filename = file.filename
+    user.resume_data = base64.b64encode(content).decode("utf-8")
+    db.commit()
+
+    return {"filename": file.filename, "message": "Resume uploaded successfully"}
+</file>
+
+<file path="routers/tickets.py">
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+import schemas
+from auth import get_current_user, require_role
+
+router = APIRouter(prefix="/tickets", tags=["tickets"])
+
+
+@router.get("", response_model=list[schemas.TicketOut])
+def list_my_tickets(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    tickets = (
+        db.query(models.Ticket)
+        .filter(models.Ticket.user_id == current_user.id)
+        .order_by(models.Ticket.created_at.desc())
+        .all()
+    )
+
+    return tickets
+
+
+@router.get("/all", response_model=schemas.TicketListOut)
+def list_all_tickets(
+    page: int = 1,
+    page_size: int = 10,
+    search: str = "",
+    status: str = "all",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("admin")),
+):
+    if page < 1:
+        page = 1
+
+    if page_size < 1:
+        page_size = 10
+
+    status = status.lower().strip()
+
+    if status not in ["all", "open", "closed"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be all, open, or closed",
+        )
+
+    base_query = (
+        db.query(models.Ticket, models.User.email)
+        .join(
+            models.User,
+            models.User.id == models.Ticket.user_id,
+        )
+    )
+
+    open_count = (
+        db.query(models.Ticket)
+        .filter(models.Ticket.status == "open")
+        .count()
+    )
+
+    closed_count = (
+        db.query(models.Ticket)
+        .filter(models.Ticket.status == "closed")
+        .count()
+    )
+
+    filtered_query = base_query
+
+    if status == "open":
+        filtered_query = filtered_query.filter(
+            models.Ticket.status == "open"
+        )
+
+    elif status == "closed":
+        filtered_query = filtered_query.filter(
+            models.Ticket.status == "closed"
+        )
+
+    if search and search.strip():
+        search_value = search.strip()
+
+        search_conditions = [
+            models.Ticket.subject.ilike(
+                f"%{search_value}%"
+            ),
+            models.Ticket.contact_name.ilike(
+                f"%{search_value}%"
+            ),
+            models.Ticket.contact_email.ilike(
+                f"%{search_value}%"
+            ),
+            models.Ticket.contact_phone.ilike(
+                f"%{search_value}%"
+            ),
+            models.User.email.ilike(
+                f"%{search_value}%"
+            ),
+        ]
+
+        try:
+            search_uuid = uuid.UUID(search_value)
+
+            search_conditions.append(
+                models.Ticket.id == search_uuid
+            )
+        except ValueError:
+            pass
+
+        filtered_query = filtered_query.filter(
+            or_(*search_conditions)
+        )
+
+    total = filtered_query.count()
+
+    offset = (page - 1) * page_size
+
+    rows = (
+        filtered_query
+        .order_by(models.Ticket.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+        .all()
+    )
+
+    tickets = []
+
+    for ticket, user_email in rows:
+        out = schemas.TicketOut.model_validate(ticket)
+        out.user_email = user_email
+        tickets.append(out)
+
+    return {
+        "tickets": tickets,
+        "total": total,
+        "open_count": open_count,
+        "closed_count": closed_count,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get(
+    "/by-code/{short_code}",
+    response_model=schemas.TicketOut,
+)
+def get_ticket_by_code(
+    short_code: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("admin")),
+):
+    all_ids = db.query(models.Ticket.id).all()
+
+    target_code = short_code.zfill(4)
+    matched_id = None
+
+    for (ticket_id,) in all_ids:
+        hex_str = str(ticket_id).replace("-", "")
+        num = int(hex_str[:8], 16) % 10000
+        code = str(num).zfill(4)
+
+        if code == target_code:
+            matched_id = ticket_id
+            break
+
+    if not matched_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found",
+        )
+
+    result = (
+        db.query(
+            models.Ticket,
+            models.User.email,
+        )
+        .join(
+            models.User,
+            models.User.id == models.Ticket.user_id,
+        )
+        .filter(models.Ticket.id == matched_id)
+        .first()
+    )
+
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found",
+        )
+
+    ticket, user_email = result
+
+    out = schemas.TicketOut.model_validate(ticket)
+    out.user_email = user_email
+
+    return out
+
+
+@router.get(
+    "/{ticket_id}",
+    response_model=schemas.TicketOut,
+)
+def get_ticket(
+    ticket_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("admin")),
+):
+    result = (
+        db.query(
+            models.Ticket,
+            models.User.email,
+        )
+        .join(
+            models.User,
+            models.User.id == models.Ticket.user_id,
+        )
+        .filter(models.Ticket.id == ticket_id)
+        .first()
+    )
+
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found",
+        )
+
+    ticket, user_email = result
+
+    out = schemas.TicketOut.model_validate(ticket)
+    out.user_email = user_email
+
+    return out
+
+
+@router.post(
+    "",
+    response_model=schemas.TicketOut,
+    status_code=201,
+)
+def create_ticket(
+    payload: schemas.TicketCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    ticket = models.Ticket(
+        user_id=current_user.id,
+        contact_name=payload.contact_name,
+        contact_email=payload.contact_email,
+        contact_phone=payload.contact_phone,
+        subject=payload.subject,
+        description=payload.description,
+        status="open",
+    )
+
+    db.add(ticket)
+    db.commit()
+    db.refresh(ticket)
+
+    return ticket
+
+
+@router.patch(
+    "/{ticket_id}/status",
+    response_model=schemas.TicketOut,
+)
+def update_ticket_status(
+    ticket_id: uuid.UUID,
+    payload: schemas.TicketStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("admin")),
+):
+    if payload.status.lower() not in ["open", "closed"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be either open or closed",
+        )
+
+    ticket = (
+        db.query(models.Ticket)
+        .filter(models.Ticket.id == ticket_id)
+        .first()
+    )
+
+    if not ticket:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found",
+        )
+
+    ticket.status = payload.status.lower()
+
+    if payload.admin_remark is not None:
+        ticket.admin_remark = payload.admin_remark
+
+    db.commit()
+    db.refresh(ticket)
+
+    return ticket
+</file>
+
+<file path="auth.py">
+import os
+from datetime import datetime, timedelta, timezone
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-to-a-long-random-secret")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(subject: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": subject, "exp": expire}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> models.User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+def require_role(required_role: str):
+    """Dependency factory - blocks the request unless the logged-in user's
+    role matches exactly. This is what keeps user accounts out of admin
+    pages and vice versa, enforced on the server, not just hidden in the UI."""
+
+    def checker(current_user: models.User = Depends(get_current_user)) -> models.User:
+        if current_user.role != required_role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"This account does not have {required_role} access",
+            )
+        return current_user
+
+    return checker
+</file>
+
+<file path="main.py">
+import os
+import uuid
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+from database import Base, engine, SessionLocal
+import models
+from routers import auth, faqs, tickets, jobs
+from routers import chat as chat_router
+from routers import profile as profile_router
+
+load_dotenv()
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Healthcare Portal API")
+
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in FRONTEND_ORIGIN.split(",")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth.router)
+app.include_router(faqs.router)
+app.include_router(tickets.router)
+app.include_router(jobs.router)
+app.include_router(chat_router.router)
+app.include_router(profile_router.router)
+
+SAMPLE_JOBS = [
+    {"title": "Duty Doctor", "organization": "Arrow Diagnostics LLP", "location": "Chennai", "job_type": "Full Time", "salary": "780000/Annual", "description": "Conduct patient consultations and basic clinical examinations. Review lab and diagnostic reports."},
+    {"title": "Radiologist", "organization": "NT Talent Healthcare", "location": "Chennai", "job_type": "Full Time", "salary": "As per company norms", "description": "Perform and interpret diagnostic imaging including X-rays, CT scans, and MRIs."},
+    {"title": "Consultant Dermatologist", "organization": "Carves Skin Clinic", "location": "Chennai", "job_type": "Full Time", "salary": "900000/Annual", "description": "Diagnose and treat skin conditions, run consultations, and manage patient treatment plans."},
+    {"title": "ICU Staff Nurse", "organization": "Apollo Hospitals", "location": "Chennai", "job_type": "Full Time", "salary": "420000/Annual", "description": "Provide critical care nursing support in the intensive care unit."},
+    {"title": "Physiotherapist", "organization": "MedPlus Care", "location": "Bangalore", "job_type": "Part Time", "salary": "35000/Month", "description": "Assess and treat patients through physical rehabilitation techniques."},
+    {"title": "Pharmacist", "organization": "Sunrise Hospitals", "location": "Bangalore", "job_type": "Full Time", "salary": "380000/Annual", "description": "Dispense medications, verify prescriptions, and counsel patients on drug usage."},
+    {"title": "Lab Technician", "organization": "Paramitha Hospitals", "location": "Hyderabad", "job_type": "Full Time", "salary": "300000/Annual", "description": "Perform diagnostic tests and maintain laboratory equipment and records."},
+    {"title": "Hospital Administrator", "organization": "Remedy Hospitals", "location": "Hyderabad", "job_type": "Full Time", "salary": "650000/Annual", "description": "Oversee daily hospital operations, staffing, and compliance."},
+]
+
+
+def seed_jobs():
+    db = SessionLocal()
+    try:
+        existing_count = db.query(models.Job).count()
+        if existing_count == 0:
+            for job_data in SAMPLE_JOBS:
+                db.add(models.Job(id=uuid.uuid4(), **job_data))
+            db.commit()
+    finally:
+        db.close()
+
+
+seed_jobs()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+</file>
+
+<file path="models.py">
+import uuid
+from sqlalchemy import Column, String, ForeignKey, DateTime, Text, Numeric
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
+from database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    name = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    resume_filename = Column(String, nullable=True)
+    resume_data = Column(Text, nullable=True)
+    role = Column(String, nullable=False, default="user")  # "user" or "admin"
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    faqs = relationship("FAQ", back_populates="owner", cascade="all, delete-orphan")
+
+
+class FAQ(Base):
+    __tablename__ = "faqs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    question = Column(Text, nullable=False)
+    answer = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    owner = relationship("User", back_populates="faqs")
+
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    contact_name = Column(String, nullable=False)
+    contact_email = Column(String, nullable=False)
+    contact_phone = Column(String, nullable=True)
+    subject = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="open")
+    admin_remark = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),onupdate=func.now())
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    title = Column(String, nullable=False)
+    organization = Column(String, nullable=False)
+    location = Column(String, nullable=False)
+    job_type = Column(String, nullable=False, default="Full Time")
+    salary = Column(String, nullable=True)
+    description = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class KnowledgeBaseFAQ(Base):
+    __tablename__ = "knowledge_base"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    category = Column(String, nullable=False)
+    question = Column(Text, nullable=False)
+    answer = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+</file>
+
+<file path="requirements.txt">
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.35
+psycopg2-binary
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]==3.3.0
+python-dotenv==1.0.1
+pydantic[email]
+requests
+python-multipart
+</file>
+
+<file path="schemas.py">
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, EmailStr, Field
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    name: str = Field(min_length=1)
+    phone: str = Field(min_length=1)
+    role: str = Field(default="user")
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+    role: str
+
+
+class UserOut(BaseModel):
+    id: uuid.UUID
+    email: EmailStr
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    role: str
+
+    class Config:
+        from_attributes = True
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+class FAQCreate(BaseModel):
+    question: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+
+
+class FAQOut(BaseModel):
+    id: uuid.UUID
+    question: str
+    answer: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TicketCreate(BaseModel):
+    contact_name: str = Field(min_length=1)
+    contact_email: EmailStr
+    contact_phone: Optional[str] = None
+    subject: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+
+
+class TicketStatusUpdate(BaseModel):
+    status: str
+    admin_remark: Optional[str] = None
+
+class TicketRemarkUpdate(BaseModel):
+    admin_remark: Optional[str] = None    
+
+
+class TicketOut(BaseModel):
+    id: uuid.UUID
+    contact_name: str
+    contact_email: str
+    contact_phone: Optional[str] = None
+    subject: str
+    description: str
+    status: str
+    admin_remark: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] =None
+    user_email: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TicketListOut(BaseModel):
+    tickets: list[TicketOut]
+    total: int
+    open_count: int
+    closed_count: int
+    page: int
+    page_size: int        
+
+
+class JobOut(BaseModel):
+    id: uuid.UUID
+    title: str
+    organization: str
+    location: str
+    job_type: str
+    salary: Optional[str] = None
+    description: str
+
+    class Config:
+        from_attributes = True
+
+
+class ChatHistoryItem(BaseModel):
+    role: str  # "user" or "assistant"
+    text: str
+
+
+class ChatQuery(BaseModel):
+    query: str = Field(min_length=1)
+    history: Optional[list[ChatHistoryItem]] = None
+    is_suggestion: bool = False
+
+
+class ChatResponse(BaseModel):
+    source: str  # "faq", "ai", "suggestions", or "ticket"
+    answer: str
+    matched_question: Optional[str] = None
+    suggestions: Optional[list[str]] = None
+    related_label: Optional[str] = None
+    related_questions: Optional[list[str]] = None
+    ticket: Optional[TicketOut] = None
+</file>
+
+<file path="seed_knowledge_base.py">
+"""
+Run this once to load all FAQs into the knowledge_base table.
+Usage: python seed_knowledge_base.py
+"""
+
+from database import SessionLocal
+import models
+
+FAQS = [
+    # ---- General ----
+    ("General", "How is my personal data protected on Nextenti?",
+     "Your data security is our top priority. We comply with government regulations when processing your Aadhaar data, using it only for lawful purposes. Your personal information remains confidential until you apply for a job. Organizations cannot view your profile or access your details unless you have applied for a job and given explicit consent."),
+
+    ("General", "Is this app only for doctors or specific healthcare professionals?",
+     "No, Nextenti is a comprehensive platform designed for all healthcare professionals - doctors, nurses, pharmacists, lab technicians, and healthcare administration staff. The app provides career opportunities and resources tailored to your field."),
+
+    ("General", "How do I update my profile picture?",
+     "Log in to your account. Personal account: go to Personal Details > Edit Profile. Organization account: go to Organization Profile > Edit Profile. Click Change Photo, upload your new image, and save."),
+
+    ("General", "Who can benefit from using this app?",
+     "Nextenti benefits current healthcare professionals and those entering the field, with flexible job opportunities, career support, coverage of up to 19 professions (doctors, nurses, pharmacists, healthcare IT, and more), and access to 14 healthcare-related sectors (hospitals, pharma companies, diagnostic labs, and more). Organizations can post jobs, find candidates, and streamline hiring."),
+
+    ("General", "Can I manage both Organization and Personal accounts within the app?",
+     "Yes. Each account must have a different mobile number and email address, with its own login credentials. You can log in between accounts as needed - to find talent (Organization account) or search/apply for jobs (Personal account)."),
+
+    ("General", "How do I contact Nextenti support for assistance?",
+     "On Mobile: tap the Profile menu > Support > Nextenti Support, then submit your query or use Live Chat. On Web: scroll to the bottom and click Nextenti Help Support, then submit your query or use Live Chat."),
+
+    ("General", "How can I reset or change my password?",
+     "If forgotten: go to the Login page, click 'Forgot Password', and follow the reset instructions. If you know your current password: log in, go to Settings > Change Password, and follow the prompts."),
+
+    ("General", "My account was deleted. How can I restore it?",
+     "Contact Nextenti Support through the application, explain your situation, and the support team will help restore your account."),
+
+    ("General", "I'm stuck while using the application. What should I do?",
+     "Open the Nextenti Support option in the application, explain the issue or step where you're stuck, and follow the guidance provided by the support team."),
+
+    # ---- Personal ----
+    ("Personal", "Can I change my profession after signing up?",
+     "Yes. Go to Edit Profile > Personal Details, select your previously chosen profession and update it to your new one, then save the changes."),
+
+    ("Personal", "How can I view a particular upcoming job?",
+     "Log in, go to My Jobs section, select the Upcoming Job tab to view all upcoming jobs, and open a specific job to see its details."),
+
+    ("Personal", "Can I negotiate the salary after receiving the offer?",
+     "Yes. After receiving an offer you can submit a 'Raise Request' to request a higher salary or changes to your compensation package, or contact the organization directly using the contact details provided in the offer letter."),
+
+    ("Personal", "How can I contact the organization after seeing a job that I'm interested in?",
+     "Apply for the job. The organization is notified of your application. If shortlisted, they'll send you an offer, and once received you can view the organization's contact details and additional info."),
+
+    ("Personal", "Can I apply to jobs in any location?",
+     "Yes, you can apply to jobs anywhere in India. Nextenti provides a location filter to search jobs in your preferred city or region and apply to convenient opportunities."),
+
+    ("Personal", "Can I post job opportunities as a candidate?",
+     "Yes. Log in to your candidate account, verify your Aadhaar via OTP, then locate the 'Post Job Information' button on your homepage, enter job details, and submit."),
+
+    ("Personal", "Can organizations view my profile?",
+     "Organizations can only view your profile after you apply for a job. Until then, your information remains private and is not shared with any employers."),
+
+    ("Personal", "Can I use my PAN card for verification?",
+     "No. Only an Aadhaar card can be used for verification as per Nextenti's regulations and security policies. PAN cards are not accepted."),
+
+    ("Personal", "Can I change from Short-term to Long-term after job accepted?",
+     "Once a job offer is accepted, changes like switching from short-term to long-term must be discussed directly with the organization."),
+
+    ("Personal", "What happens if I miss the check-in and check-out time?",
+     "Notify your supervisor or HR department about the situation, follow their guidance on missed-time policies, and take any recommended steps to resolve it."),
+
+    ("Personal", "What if my profession isn't listed in the dropdown options?",
+     "Select 'Other' and manually enter your specific profession. Nextenti is continuously expanding its supported professions list."),
+
+    ("Personal", "Can I track my job application status?",
+     "Go to Manage Jobs > Applied Jobs to check the status of each application, such as Interview Scheduled or Offered."),
+
+    ("Personal", "Where can I view my job offers?",
+     "Go to Applied and select the 'Offered Jobs' section on your homepage to browse the details of all offers you've received."),
+
+    ("Personal", "Can I save jobs to view later?",
+     "In Search Jobs, click the Save icon next to any listing. Access saved jobs later in Saved Jobs, located next to Recommended Jobs in the Explore Jobs section."),
+
+    ("Personal", "How do I get started with finding a job?",
+     "Download the app or visit the website, sign up with your basic information, navigate to 'Search Jobs', use keywords like job title/organization/location to refine your search, and apply to matching opportunities."),
+
+    ("Personal", "How can I update my preferred work locations?",
+     "Go to Manage Preferences > Location Preferences and add or remove cities, states, or areas where you want to work."),
+
+    ("Personal", "Can I get notifications for interview schedules?",
+     "Yes. When an organization schedules an interview, you'll receive in-app notifications and emails/SMS if enabled."),
+
+    ("Personal", "How can I receive personalized job recommendations?",
+     "Go to Home Page > Manage Preferences, fill in organization type/state/city/area of work, and Nextenti's AI will match you with suitable jobs shown in 'Recommended Jobs'."),
+
+    ("Personal", "Can I delete my account?",
+     "Go to Settings > Delete Account, enter your password, click Delete Account, and confirm. Your data will be removed per Nextenti's privacy policy."),
+
+    ("Personal", "How can I find job opportunities?",
+     "From the Login Page: use the Job Search option with location/organization/title filters. From your Homepage: click 'Search Jobs' and use filters to browse results."),
+
+    ("Personal", "Can I apply to multiple jobs?",
+     "Yes, you can apply to multiple jobs at the same time, increasing your chances of getting shortlisted."),
+
+    ("Personal", "What is the availability function, and how does it work?",
+     "The Availability function lets you set preferred workdays and hours in your Personal account. Nextenti's AI-driven system matches you with jobs that fit your schedule for better work-life balance."),
+
+    ("Personal", "How can I create availability only for Consultations and Procedures?",
+     "Log in to your Personal account, click 'Add Availability', under Job Type select 'Procedure' and 'Consultation', enter your available dates/timings, and save."),
+
+    ("Personal", "Who can see my Availability?",
+     "Your availability is private and only visible/manageable by you in the Availability section. Organizations only see your details when you apply for a job, not your full calendar."),
+
+    ("Personal", "How does the job matching algorithm work?",
+     "Nextenti analyzes your Profession, Preferences, and Availability and compares them with job postings to recommend the best-suited jobs, viewable in 'Recommended Jobs'."),
+
+    ("Personal", "How can I filter jobs by organization type?",
+     "Open Search Jobs and use the search bar to select or type the Organization Type, such as Hospital, Clinic, Pharma, Lab, etc."),
+
+    ("Personal", "How can I optimize my job search experience?",
+     "Go to your Candidate Account > Manage Preferences, enter organization type/location preferences, then open Availability and specify when you're available to work."),
+
+    ("Personal", "What should I do if I receive a job offer I'm not interested in?",
+     "Go to the Applied section > Offered Jobs, locate the offer, and click Decline to reject it."),
+
+    ("Personal", "Can I update my registered mobile number?",
+     "Log in, go to Edit Profile > Personal Details, click Edit next to Mobile Number, enter your password for verification, provide the new number, verify with OTP, and click Save."),
+
+    # ---- Organization ----
+    ("Organization", "Can I hire immediately?",
+     "Yes. You can post vacancies in real time, candidates get instant notifications, AI-powered matching connects you to relevant candidates, and you can communicate directly through in-app chat."),
+
+    ("Organization", "How can I post a job on Nextenti?",
+     "Sign up or log in with your organization's details, go to 'Create Job', fill in job title/profession/type/duration/description/required skills, and click 'Post Job'."),
+
+    ("Organization", "Where can I view my Posted Jobs?",
+     "Log in to your Organization account, go to the Home screen, and click Posted Jobs."),
+
+    ("Organization", "Where can I view my drafted jobs?",
+     "Log in to your Organization account, go to the Home screen, and click Drafted Jobs."),
+
+    ("Organization", "Where can I view my closed jobs?",
+     "Log in to your Organization account, go to the Home screen, and click Closed Jobs."),
+
+    ("Organization", "Where can I view my cancelled jobs?",
+     "Log in to your Organization account, go to the Home screen, and click Cancelled Jobs."),
+
+    ("Organization", "How can I close a job?",
+     "Go to Posted Jobs or Drafted Jobs, find the job, click the three-dot menu on the job card, and select Close Job. It moves to Closed Jobs."),
+
+    ("Organization", "How can I cancel a job?",
+     "Go to Posted Jobs or Drafted Jobs, find the job, click the three-dot menu, and select Cancel Job. It moves to Cancelled Jobs."),
+
+    ("Organization", "What is the use of the Timesheet section?",
+     "The Timesheet section tracks employee attendance and work progress, recording daily check-ins and check-outs to monitor working hours."),
+
+    ("Organization", "Where can I view the timesheet history of employees?",
+     "Log in to your Organization account and navigate to the Timesheet Logs section to see the complete history."),
+
+    ("Organization", "Where can I see my Action Required and Updates?",
+     "Log in to your Organization account and go to the Dashboard section to see Action Required items and Updates."),
+
+    ("Organization", "Where can I view chat requests?",
+     "View via the Requests section in the header, or go to Manage Jobs > Requests for chat requests related to specific jobs."),
+
+    ("Organization", "How can I change my password?",
+     "On the login page, click Forgot Password, follow the prompts with your registered email/mobile, then create a new password."),
+
+    ("Organization", "How can I delete my account?",
+     "Log in, click the Profile menu, select Delete Account, and follow the prompts to confirm."),
+
+    ("Organization", "Where can I edit my organization details?",
+     "Log in, navigate to the Profile section in the side menu, and you'll be directed to Organization Details."),
+
+    ("Organization", "Where can I edit my billing details?",
+     "Log in, go to Profile in the side menu, then click Next through Organization Details > Organization Profile > Authorized Person Details to reach the Billing Details page."),
+
+    ("Organization", "Where can I edit my authorized person details?",
+     "Log in, go to Profile in the side menu, then click Next through Organization Details > Organization Profile to reach the Authorized Person Details page."),
+
+    ("Organization", "How can I manage users in my organization account?",
+     "Go to User Management in the side menu, click Add User, provide name/email/role and permissions, then click Submit. The invited user receives login credentials."),
+
+    ("Organization", "How can I take a subscription?",
+     "Go to the Profile menu, select Manage Subscription, choose a plan based on your needs, and proceed with payment to activate it."),
+]
+
+
+def run():
+    db = SessionLocal()
+    try:
+        existing = db.query(models.KnowledgeBaseFAQ).count()
+        if existing > 0:
+            print(f"knowledge_base already has {existing} rows. Skipping seed.")
+            return
+
+        for category, question, answer in FAQS:
+            db.add(models.KnowledgeBaseFAQ(category=category, question=question, answer=answer))
+
+        db.commit()
+        print(f"Seeded {len(FAQS)} FAQs into knowledge_base.")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    run()
+</file>
+
+</files>
