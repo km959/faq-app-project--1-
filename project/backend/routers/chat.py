@@ -1266,7 +1266,7 @@ def process_public_chat(
             ),
         }
 
-    # Exact FAQ question → database answer.
+    
     exact = get_faq_by_exact_question(
         db,
         query,
